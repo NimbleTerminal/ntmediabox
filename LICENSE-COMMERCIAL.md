@@ -34,4 +34,4 @@ A Commercial License from **Neomantra Corp.** grants:
 
 To inquire about Commercial OEM or Enterprise Runtime licensing, contact **Neomantra Corp.**:
 
-- **Email:** [licensing@neomantra.net](mailto:licensing@neomantra.net)
+- **Email:** [licensing@nimbleterminal.com](mailto:licensing@nimbleterminal.com)
