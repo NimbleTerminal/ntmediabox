@@ -21,15 +21,15 @@ jobs:
         working-directory: ntmediabox
     steps:
       - name: Checkout ntmediabox
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: ntmediabox
       - name: Checkout ntconfine
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: NimbleTerminal/ntconfine
           path: ntconfine
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26.x"
       - name: Vet
