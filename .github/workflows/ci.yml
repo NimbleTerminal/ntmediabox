@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CGO_ENABLED: "0"
+  NTMEDIABOX_REQUIRE_SANDBOX: "1"
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: ntmediabox
+    steps:
+      - name: Checkout ntmediabox
+        uses: actions/checkout@v4
+        with:
+          path: ntmediabox
+      - name: Checkout ntconfine
+        uses: actions/checkout@v4
+        with:
+          repository: NimbleTerminal/ntconfine
+          path: ntconfine
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+      - name: Vet
+        run: |
+          go vet ./...
+          go -C pkg/mediabox vet ./...
+      - name: Test (root and pkg/mediabox, sandbox required)
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            go test -race -count=1 ./...
+            go -C pkg/mediabox test -race -count=1 ./...
+          else
+            go test -count=1 ./...
+            go -C pkg/mediabox test -count=1 ./...
+          fi
+      - name: Cross-build (js/wasm, windows/amd64, linux/amd64, linux/arm64)
+        run: |
+          GOOS=js GOARCH=wasm go build .
+          GOOS=js GOARCH=wasm go -C pkg/mediabox build ./...
+          GOOS=windows GOARCH=amd64 go build ./...
+          GOOS=windows GOARCH=amd64 go -C pkg/mediabox build ./...
+          GOOS=linux GOARCH=amd64 go build ./...
+          GOOS=linux GOARCH=arm64 go build ./...
+      - name: Check third-party notices
+        run: |
+          mkdir -p dist
+          go run ./internal/tools/notices > dist/THIRD_PARTY_NOTICES.md
+          cmp THIRD_PARTY_NOTICES.md dist/THIRD_PARTY_NOTICES.md
+      - name: Smoke fuzz
+        run: |
+          go test -run=^$ -fuzz=FuzzPolicyValidate -fuzztime=1000x .
+          go -C pkg/mediabox test -run=^$ -fuzz=FuzzParseStatusAndOpen -fuzztime=1000x .
+          go -C pkg/mediabox test -run=^$ -fuzz=FuzzSanitizeAndTruncateUTF8 -fuzztime=1000x .
+          go -C pkg/mediabox test -run=^$ -fuzz=FuzzServeRead -fuzztime=1000x .
+          go -C pkg/mediabox test -run=^$ -fuzz=FuzzRenderClientResp -fuzztime=1000x .
+          go -C pkg/mediabox test -run=^$ -fuzz=FuzzClientRead -fuzztime=1000x .

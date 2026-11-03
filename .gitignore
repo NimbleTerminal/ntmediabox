@@ -1,0 +1,5 @@
+bin/
+dist/
+.task/
+.DS_Store
+go.work.sum
