@@ -16,19 +16,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        working-directory: ntmediabox
     steps:
-      - name: Checkout ntmediabox
-        uses: actions/checkout@v7
-        with:
-          path: ntmediabox
-      - name: Checkout ntconfine
-        uses: actions/checkout@v7
-        with:
-          repository: NimbleTerminal/ntconfine
-          path: ntconfine
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version: "1.26.x"
@@ -58,6 +47,12 @@ jobs:
           mkdir -p dist
           go run ./internal/tools/notices > dist/THIRD_PARTY_NOTICES.md
           cmp THIRD_PARTY_NOTICES.md dist/THIRD_PARTY_NOTICES.md
+      - name: Published module graph (no workspace)
+        # Fails while the root module uses pkg/mediabox symbols that are not
+        # tagged yet; that is the signal to tag pkg/mediabox and bump go.mod.
+        run: |
+          GOWORK=off go vet ./...
+          GOWORK=off go test -count=1 ./...
       - name: Smoke fuzz
         run: |
           go test -run=^$ -fuzz=FuzzPolicyValidate -fuzztime=1000x .
@@ -66,3 +61,29 @@ jobs:
           go -C pkg/mediabox test -run=^$ -fuzz=FuzzServeRead -fuzztime=1000x .
           go -C pkg/mediabox test -run=^$ -fuzz=FuzzRenderClientResp -fuzztime=1000x .
           go -C pkg/mediabox test -run=^$ -fuzz=FuzzClientRead -fuzztime=1000x .
+
+  # Early warning only: the released module pins a tagged ntconfine.
+  ntconfine-main:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: ntmediabox
+    steps:
+      - name: Checkout ntmediabox
+        uses: actions/checkout@v7
+        with:
+          path: ntmediabox
+      - name: Checkout ntconfine
+        uses: actions/checkout@v7
+        with:
+          repository: NimbleTerminal/ntconfine
+          path: ntconfine
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.x"
+      - name: Test against ntconfine main
+        run: |
+          go work use ../ntconfine ../ntconfine/pkg/confine
+          go vet ./...
+          go test -count=1 ./...

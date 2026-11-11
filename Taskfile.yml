@@ -129,7 +129,15 @@ tasks:
   test-sandbox-linux:
     desc: Run the sandbox tests on a Linux kernel in Docker
     cmds:
-      - docker run --rm -v "$PWD":/work/ntmediabox -v "$PWD/../ntconfine":/work/ntconfine -w /work/ntmediabox -e CGO_ENABLED=0 -e NTMEDIABOX_REQUIRE_SANDBOX=1 --security-opt seccomp=unconfined golang:1.26 go test . -count=1
+      - docker run --rm -v "$PWD":/work/ntmediabox -w /work/ntmediabox -e CGO_ENABLED=0 -e NTMEDIABOX_REQUIRE_SANDBOX=1 --security-opt seccomp=unconfined golang:1.26 go test . -count=1
+
+  check-published:
+    desc: vet and test against the pinned, published modules (no workspace); run before tagging
+    env:
+      GOWORK: 'off'
+    cmds:
+      - go vet ./...
+      - go test {{.RACE}} -count=1 ./...
 
   check:
     desc: vet, test, wasm, windows, linux, notices-check

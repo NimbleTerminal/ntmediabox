@@ -1,0 +1,6 @@
+nimbleterminal.dev/ntconfine v0.2.0 h1:0dzxECIzGetgDSsJnWNdAC6B8JgZhX3kScDDeRLYG38=
+nimbleterminal.dev/ntconfine v0.2.0/go.mod h1:gm6zp6vX0vmhMeZSPZsvyh2vqlCU5/6r+9eHBhpRtfc=
+nimbleterminal.dev/ntconfine/pkg/confine v0.2.0 h1:uL4ze06dk/MK/WT2Mzt3k/9SDYBXLlD++bvdOdSYGpE=
+nimbleterminal.dev/ntconfine/pkg/confine v0.2.0/go.mod h1:SZhYAR6sFLohqY8Uu57x3M6rzuzsMd2E9D5agF3XR20=
+nimbleterminal.dev/ntmediabox/pkg/mediabox v0.2.0 h1:ZgVXiPkIiXZT/S9NnjgfXhrceDKNbgTLsOF6JWgWUCE=
+nimbleterminal.dev/ntmediabox/pkg/mediabox v0.2.0/go.mod h1:xhqy84YnNQvoSKQjSvJSSku2mKCP4tzI44fgOu4NlgU=

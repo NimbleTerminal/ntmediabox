@@ -2,7 +2,7 @@
 
 ## Build and test
 
-Local development uses [`go.work`](go.work) (`use ( . ./pkg/mediabox ../ntconfine ../ntconfine/pkg/confine )`). Always build and test with `CGO_ENABLED=0`:
+The checked-in [`go.work`](go.work) joins only the two modules in this repository (`use ( . ./pkg/mediabox )`); `ntconfine` comes from the version pinned in [`go.mod`](go.mod), so tests exercise what consumers get. To develop against a local `ntconfine` checkout, copy `go.work` to `go.work.local` (git-ignored), add `../ntconfine` and `../ntconfine/pkg/confine`, and run with `GOWORK=$PWD/go.work.local`. Always build and test with `CGO_ENABLED=0`:
 
 ```sh
 task check
@@ -28,3 +28,4 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build ./...
 - **Generated notices:** Run `task notices` (`task notices-check`) whenever dependencies or build targets change.
 - **Documented bounds:** The wire-bound tables in `SECURITY.md` are generated from the exported constants in `pkg/mediabox`. After changing a bound, run `task security-doc`; `TestSecurityDocInSync` and `TestUsageDocStatesEnforcedLimits` fail when the docs drift.
 - **Worker self-checks:** `Serve` and `ServeRender` validate decoder and handler output against the request and report a readable error, so a worker bug is not mistaken for a hostile peer.
+- **Release order:** `pkg/mediabox` is its own module. Tag `pkg/mediabox/vX.Y.Z` first, bump the root [`go.mod`](go.mod) to it (and to the intended `ntconfine` tag), run `task check-published`, then tag `vX.Y.Z`. Never tag the root while `task check-published` fails.
