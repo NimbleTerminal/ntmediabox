@@ -537,8 +537,8 @@ func TestSanitizeWorkerStringsAndUTF8Truncation(t *testing.T) {
 	if parsed.Err != "decerror!next" {
 		t.Fatalf("parsed.Err = %q, want %q", parsed.Err, "decerror!next")
 	}
-	if parsed.CaptionText != "line1\nline2\tok" {
-		t.Fatalf("parsed.CaptionText = %q, want %q", parsed.CaptionText, "line1\nline2\tok")
+	if parsed.CaptionText != "line1\nline2 ok" {
+		t.Fatalf("parsed.CaptionText = %q, want %q", parsed.CaptionText, "line1\nline2 ok")
 	}
 	if len(parsed.CaptionTracks) != 1 {
 		t.Fatalf("tracks = %d, want 1", len(parsed.CaptionTracks))
@@ -689,13 +689,13 @@ func assertCleanWorkerStr(t *testing.T, s string, allowNewline bool) {
 	}
 	for _, r := range s {
 		if r < 0x20 {
-			if allowNewline && (r == '\n' || r == '\t') {
+			if allowNewline && r == '\n' {
 				continue
 			}
 			t.Fatalf("unexpected C0 control %U in %q", r, s)
 		}
-		if r == 0x7f || (r >= 0x80 && r <= 0x9f) || (r >= 0x202a && r <= 0x202e) || (r >= 0x2066 && r <= 0x2069) {
-			t.Fatalf("unexpected control/bidi rune %U in %q", r, s)
+		if r == 0x7f || (r >= 0x80 && r <= 0x9f) || isStrippedFormatRune(r) {
+			t.Fatalf("unexpected control/format rune %U in %q", r, s)
 		}
 	}
 }

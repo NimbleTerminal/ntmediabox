@@ -24,6 +24,12 @@ const (
 	MaxRenderMetaBytes = 16 << 20  // 16 MiB structured metadata/text payload
 )
 
+// Fixed-size portions of the render protocol's two messages.
+const (
+	RenderReqFixedBytes   = renderReqFixed   // fields from page through dataLen in a request
+	RenderRespHeaderBytes = renderRespHeader // fields from flags through metaLen in a response
+)
+
 const (
 	msgRenderReq  = 0x20
 	msgRenderResp = 0x21
@@ -78,6 +84,16 @@ type RenderResponse struct {
 	Image  *image.RGBA // optional bounds-checked RGBA raster
 }
 
+// RenderError is an error a worker reported for one request, as opposed to a
+// failure of the connection or of the worker process. Unless Ended is set the
+// session is still usable for further requests.
+type RenderError struct {
+	Msg   string // the worker's sanitized error text
+	Ended bool   // the worker ended its session with this response
+}
+
+func (e *RenderError) Error() string { return e.Msg }
+
 // RenderHandler handles document/image requests inside a confined worker process.
 type RenderHandler interface {
 	Handle(req RenderRequest) (RenderResponse, error)
@@ -117,7 +133,7 @@ func ToRGBA(src image.Image) *image.RGBA {
 type RenderClient struct {
 	conn   io.ReadWriteCloser
 	onKill func()
-	mu     sync.Mutex
+	turn   chan struct{} // holds one token; a Do owns the connection while it holds it
 	once   sync.Once
 	closed atomic.Bool
 	errMu  sync.Mutex
@@ -126,17 +142,20 @@ type RenderClient struct {
 
 // NewRenderClient wraps conn as a host-side render client.
 func NewRenderClient(conn io.ReadWriteCloser) *RenderClient {
-	return &RenderClient{conn: conn}
+	return NewRenderClientWithKill(conn, nil)
 }
 
 // NewRenderClientWithKill wraps conn and invokes onKill when Close is called or
 // when a request is cancelled/violates the wire protocol.
 func NewRenderClientWithKill(conn io.ReadWriteCloser, onKill func()) *RenderClient {
-	return &RenderClient{conn: conn, onKill: onKill}
+	c := &RenderClient{conn: conn, onKill: onKill, turn: make(chan struct{}, 1)}
+	c.turn <- struct{}{}
+	return c
 }
 
-// Err returns the terminal error that closed this client, or nil if open or
-// closed cleanly via Close.
+// Err returns the terminal error that closed this client, or nil if it is open
+// or was closed cleanly (by Close, or by a worker that ended its session without
+// an error). A worker that ends its session with an error leaves a *RenderError.
 func (c *RenderClient) Err() error {
 	c.errMu.Lock()
 	defer c.errMu.Unlock()
@@ -165,7 +184,14 @@ func (c *RenderClient) Close() error {
 }
 
 // Do sends req to the worker and reads its bounds-checked RenderResponse.
-// If ctx is cancelled before the worker replies, the connection is closed immediately.
+// Requests are served one at a time; a Do whose ctx ends while it is still
+// waiting for an earlier request returns ctx.Err() and leaves the client open.
+// If ctx ends after the request has been sent, the connection is closed (and
+// the worker killed) because the reply can no longer be matched to a request.
+// An error the worker reports for the request is returned as a *RenderError
+// alongside the response; any other error means the connection is gone.
+// Do never times out on its own: pass a ctx with a deadline, or a silent worker
+// blocks the call indefinitely.
 func (c *RenderClient) Do(ctx context.Context, req RenderRequest) (RenderResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -184,21 +210,19 @@ func (c *RenderClient) Do(ctx context.Context, req RenderRequest) (RenderRespons
 		return RenderResponse{}, fmt.Errorf("ntmediabox: render data exceeds %d bytes", MaxRenderDataBytes)
 	}
 
-	maxW := req.Width
-	if maxW <= 0 || maxW > MaxRenderSide {
-		maxW = MaxRenderSide
-	}
-	maxH := req.Height
-	if maxH <= 0 || maxH > MaxRenderSide {
-		maxH = MaxRenderSide
-	}
-	maxPixels := req.MaxPixels
-	if maxPixels <= 0 || maxPixels > MaxRenderPixels {
-		maxPixels = MaxRenderPixels
-	}
+	maxW, maxH, maxPixels := renderImageLimits(req)
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	// Wait for the connection without outliving ctx: a request that never
+	// reached the worker must not close the client when its context expires.
+	select {
+	case <-c.turn:
+	case <-ctx.Done():
+		return RenderResponse{}, ctx.Err()
+	}
+	defer func() { c.turn <- struct{}{} }()
+	if err := ctx.Err(); err != nil {
+		return RenderResponse{}, err
+	}
 	if c.closed.Load() {
 		return RenderResponse{}, io.ErrClosedPipe
 	}
@@ -229,13 +253,60 @@ func (c *RenderClient) Do(ctx context.Context, req RenderRequest) (RenderRespons
 		c.closeWithErr(res.err)
 		return RenderResponse{}, res.err
 	}
-	if res.resp.Ended {
-		c.closeWithErr(nil)
-	}
+	var appErr error
 	if res.resp.Err != "" {
-		return res.resp, errors.New(res.resp.Err)
+		appErr = &RenderError{Msg: res.resp.Err, Ended: res.resp.Ended}
 	}
-	return res.resp, nil
+	if res.resp.Ended {
+		c.closeWithErr(appErr)
+	}
+	return res.resp, appErr
+}
+
+// renderImageLimits returns the largest image a worker may return for req.
+func renderImageLimits(req RenderRequest) (maxW, maxH, maxPixels int) {
+	maxW = req.Width
+	if maxW <= 0 || maxW > MaxRenderSide {
+		maxW = MaxRenderSide
+	}
+	maxH = req.Height
+	if maxH <= 0 || maxH > MaxRenderSide {
+		maxH = MaxRenderSide
+	}
+	maxPixels = req.MaxPixels
+	if maxPixels <= 0 || maxPixels > MaxRenderPixels {
+		maxPixels = MaxRenderPixels
+	}
+	return maxW, maxH, maxPixels
+}
+
+// validIntrinsic reports whether v is a finite, non-negative intrinsic dimension.
+func validIntrinsic(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0
+}
+
+// checkRenderResp reports why the host would reject resp as a reply to req, so
+// a worker can answer with a readable error and keep its session.
+func checkRenderResp(req RenderRequest, resp RenderResponse) error {
+	if !validIntrinsic(resp.Width) || !validIntrinsic(resp.Height) {
+		return fmt.Errorf("ntmediabox: worker intrinsic size %vx%v is not finite and non-negative", resp.Width, resp.Height)
+	}
+	if len(resp.Meta) > MaxRenderMetaBytes {
+		return fmt.Errorf("ntmediabox: worker response meta is %d bytes (limit %d)", len(resp.Meta), MaxRenderMetaBytes)
+	}
+	if resp.Image == nil {
+		return nil
+	}
+	b := resp.Image.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if w <= 0 || h <= 0 {
+		return nil // ToRGBA drops an empty image
+	}
+	maxW, maxH, maxPixels := renderImageLimits(req)
+	if w > maxW || h > maxH || uint64(w)*uint64(h) > uint64(maxPixels) {
+		return fmt.Errorf("ntmediabox: worker image %dx%d exceeds the requested %dx%d (%d pixels)", w, h, maxW, maxH, maxPixels)
+	}
+	return nil
 }
 
 func writeRenderReq(w io.Writer, req RenderRequest) error {
@@ -416,6 +487,9 @@ func readRenderResp(r io.Reader, maxW, maxH, maxPixels int) (RenderResponse, err
 	if pages < 0 || page < 0 || uint32(errLen) > maxErrLen || metaLen > MaxRenderMetaBytes {
 		return RenderResponse{}, ErrProtocol
 	}
+	if !validIntrinsic(width) || !validIntrinsic(height) {
+		return RenderResponse{}, ErrProtocol
+	}
 
 	var pixBytes uint64
 	if imgW != 0 || imgH != 0 {
@@ -451,6 +525,9 @@ func readRenderResp(r io.Reader, maxW, maxH, maxPixels int) (RenderResponse, err
 		if !ok {
 			return RenderResponse{}, ErrProtocol
 		}
+		if cleanErr == "" {
+			cleanErr = unprintableWorkerErr
+		}
 		resp.Err = cleanErr
 	}
 	if metaLen > 0 {
@@ -484,6 +561,9 @@ func ServeRender(conn io.ReadWriter, h RenderHandler) error {
 			return err
 		}
 		resp := invokeRenderHandler(h, req)
+		if err := checkRenderResp(req, resp); err != nil {
+			resp = RenderResponse{Err: err.Error(), Ended: resp.Ended}
+		}
 		if err := writeRenderResp(conn, resp); err != nil {
 			return err
 		}

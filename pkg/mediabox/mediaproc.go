@@ -27,16 +27,29 @@ import (
 // MaxFrameSide bounds a video frame's width and height in pixels.
 const MaxFrameSide = 4096
 
+// Wire bounds of the streaming media protocol. They are exported so hosts,
+// workers in other languages, and SECURITY.md can cite the enforced values.
 const (
-	maxControlLen     = 32 << 10 // maximum length (type + payload) for any non-frame message (covers max Status = 21311B)
-	frameHeader       = 8 + 8 + 4 + 4
+	MaxControlBytes     = 32 << 10      // largest non-frame message (type byte + payload)
+	FrameHeaderBytes    = 8 + 8 + 4 + 4 // gen + seq + width + height before a frame's pixels
+	MaxCaptions         = 16            // sidecar captions per OpenRequest
+	MaxTracks           = 32            // caption tracks per Status
+	MaxErrBytes         = 1024          // Status.Err and RenderResponse.Err
+	MaxCaptionTextBytes = 4096          // Status.CaptionText
+	MaxTrackFieldBytes  = 128           // each Track or Caption label/language/ID/kind
+	MaxNameBytes        = 255           // media kind, media filename, caption filename
+)
+
+const (
+	maxControlLen     = MaxControlBytes // covers the largest Status (21823 bytes)
+	frameHeader       = FrameHeaderBytes
 	serveInterval     = time.Second / 30
-	maxCaptions       = 16
-	maxTracks         = 32
-	maxErrLen         = 512
-	maxCaptionTextLen = 4096
-	maxTrackFieldLen  = 128
-	maxNameLen        = 255
+	maxCaptions       = MaxCaptions
+	maxTracks         = MaxTracks
+	maxErrLen         = MaxErrBytes
+	maxCaptionTextLen = MaxCaptionTextBytes
+	maxTrackFieldLen  = MaxTrackFieldBytes
+	maxNameLen        = MaxNameBytes
 )
 
 // Message types on the wire.
@@ -199,10 +212,16 @@ func readStr(b []byte, maxLen int) (string, []byte, bool) {
 	return string(b[:n]), b[n:], true
 }
 
-// sanitizeWorkerString validates that s is valid UTF-8 and strips terminal
-// escape sequences (CSI/OSC), C0/C1 control characters, DEL, and Unicode
-// bidirectional override codepoints. When allowNewline is true, '\n' and '\t'
-// are preserved.
+// unprintableWorkerErr replaces a worker error string that was non-empty on the
+// wire but sanitized to nothing, so a failure never reads as success.
+const unprintableWorkerErr = "worker error (unprintable message)"
+
+// sanitizeWorkerString validates that s is UTF-8 and makes it safe to show in a
+// terminal. It removes whole escape sequences (CSI, OSC, DCS, SOS, PM, APC and
+// nF/two-byte ESC sequences, in both 7-bit and C1 forms), every remaining C0/C1
+// control character, DEL, the Unicode line and paragraph separators, and the
+// bidirectional marks, embeddings, overrides and isolates. A tab becomes a
+// space. '\n' is preserved only when allowNewline is true.
 func sanitizeWorkerString(s string, allowNewline bool) (string, bool) {
 	if !utf8.ValidString(s) {
 		return "", false
@@ -210,60 +229,87 @@ func sanitizeWorkerString(s string, allowNewline bool) (string, bool) {
 	if s == "" {
 		return "", true
 	}
+	rs := []rune(s)
 	var b strings.Builder
 	b.Grow(len(s))
-	for i := 0; i < len(s); {
-		if s[i] == 0x1b {
-			i++
-			if i >= len(s) {
-				break
+	for i := 0; i < len(rs); i++ {
+		r := rs[i]
+		switch {
+		case r == 0x1b:
+			if i+1 < len(rs) {
+				i = skipEscapeSequence(rs, i+1)
 			}
-			switch s[i] {
-			case '[': // CSI: ESC [ params intermediates final
-				i++
-				for i < len(s) && s[i] >= 0x30 && s[i] <= 0x3f {
-					i++
-				}
-				for i < len(s) && s[i] >= 0x20 && s[i] <= 0x2f {
-					i++
-				}
-				if i < len(s) && s[i] >= 0x40 && s[i] <= 0x7e {
-					i++
-				}
-			case ']': // OSC: ESC ] ... (BEL or ST)
-				i++
-				for i < len(s) {
-					if s[i] == 0x07 {
-						i++
-						break
-					}
-					if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '\\' {
-						i += 2
-						break
-					}
-					i++
-				}
-			default:
-				r, w := utf8.DecodeRuneInString(s[i:])
-				_ = r
-				i += w
-			}
-			continue
-		}
-		r, w := utf8.DecodeRuneInString(s[i:])
-		i += w
-		if r < 0x20 {
-			if allowNewline && (r == '\n' || r == '\t') {
+		case r == 0x9b: // C1 CSI
+			i = skipCSI(rs, i+1)
+		case r == 0x90 || r == 0x98 || r == 0x9d || r == 0x9e || r == 0x9f: // C1 DCS, SOS, OSC, PM, APC
+			i = skipStringSequence(rs, i+1)
+		case r == '\n':
+			if allowNewline {
 				b.WriteRune(r)
 			}
-			continue
+		case r == '\t':
+			b.WriteByte(' ')
+		case r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) || isStrippedFormatRune(r):
+		default:
+			b.WriteRune(r)
 		}
-		if r == 0x7f || (r >= 0x80 && r <= 0x9f) || (r >= 0x202a && r <= 0x202e) || (r >= 0x2066 && r <= 0x2069) {
-			continue
-		}
-		b.WriteRune(r)
 	}
 	return b.String(), true
+}
+
+// skipEscapeSequence consumes the sequence introduced by an ESC whose next rune
+// is rs[i] and returns the index of the last rune consumed.
+func skipEscapeSequence(rs []rune, i int) int {
+	switch rs[i] {
+	case '[':
+		return skipCSI(rs, i+1)
+	case ']', 'P', 'X', '^', '_':
+		return skipStringSequence(rs, i+1)
+	}
+	// nF sequences: intermediates 0x20..0x2f followed by one final byte.
+	for i < len(rs) && rs[i] >= 0x20 && rs[i] <= 0x2f {
+		i++
+	}
+	if i < len(rs) && rs[i] >= 0x30 && rs[i] <= 0x7e {
+		return i
+	}
+	return i - 1
+}
+
+// skipCSI consumes CSI parameter and intermediate bytes starting at rs[i] plus
+// the final byte, returning the index of the last rune consumed.
+func skipCSI(rs []rune, i int) int {
+	for i < len(rs) && rs[i] >= 0x20 && rs[i] <= 0x3f {
+		i++
+	}
+	if i < len(rs) && rs[i] >= 0x40 && rs[i] <= 0x7e {
+		return i
+	}
+	return i - 1
+}
+
+// skipStringSequence consumes an OSC/DCS/SOS/PM/APC payload starting at rs[i]
+// up to and including its BEL or ST terminator. An unterminated payload is
+// dropped only to the end of its line so it cannot swallow later text.
+func skipStringSequence(rs []rune, i int) int {
+	for ; i < len(rs); i++ {
+		switch {
+		case rs[i] == 0x07 || rs[i] == 0x9c:
+			return i
+		case rs[i] == 0x1b && i+1 < len(rs) && rs[i+1] == '\\':
+			return i + 1
+		case rs[i] == '\n':
+			return i - 1
+		}
+	}
+	return i
+}
+
+// isStrippedFormatRune reports whether r is a Unicode line/paragraph separator
+// or a bidirectional formatting control.
+func isStrippedFormatRune(r rune) bool {
+	return r == 0x061c || r == 0x200e || r == 0x200f || r == 0x2028 || r == 0x2029 ||
+		(r >= 0x202a && r <= 0x202e) || (r >= 0x2066 && r <= 0x2069)
 }
 
 func readCleanStr(b []byte, maxLen int, allowNewline bool) (string, []byte, bool) {
@@ -745,10 +791,14 @@ func parseStatus(b []byte) (Status, bool) {
 		return Status{}, false
 	}
 	rest := b[fixedHeader:]
+	rawErrLen := len(rest)
 	var ok bool
 	s.Err, rest, ok = readCleanStr(rest, maxErrLen, false)
 	if !ok {
 		return Status{}, false
+	}
+	if s.Err == "" && rawErrLen-len(rest) > 2 {
+		s.Err = unprintableWorkerErr
 	}
 	s.CaptionText, rest, ok = readCleanStr(rest, maxCaptionTextLen, true)
 	if !ok || len(rest) < 1 {
@@ -975,8 +1025,17 @@ func Serve(conn io.ReadWriter, open func(kind string) (Decoder, error)) error {
 				continue
 			}
 			rgba, fw, fh, err := d.Frame(w, h)
-			fail(err)
+			if err != nil {
+				fail(err)
+				continue
+			}
 			if rgba == nil {
+				continue
+			}
+			// Checked here so a decoder bug surfaces as a Failed status with a
+			// reason, not as the host killing the worker for a protocol violation.
+			if fw < 1 || fh < 1 || fw > w || fh > h || uint64(len(rgba)) != uint64(fw)*uint64(fh)*4 {
+				fail(fmt.Errorf("decoder returned an invalid %dx%d frame (%d bytes) for a %dx%d box", fw, fh, len(rgba), w, h))
 				continue
 			}
 			seq++
