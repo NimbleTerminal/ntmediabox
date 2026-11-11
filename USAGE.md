@@ -92,10 +92,30 @@ resp, err := rc.Do(ctx, ntmediabox.RenderRequest{
 	Data:      pdfBytes,
 })
 if err != nil {
-	return fmt.Errorf("render failed (%w): %s", err, helper.Stderr())
+	var appErr *ntmediabox.RenderError
+	if errors.As(err, &appErr) && !appErr.Ended {
+		// The worker rejected this request (for example, a corrupt file) and
+		// is still serving; rc can be used for the next request.
+		return fmt.Errorf("render failed: %w", err)
+	}
+	// Anything else means the connection or the worker process is gone.
+	return fmt.Errorf("render worker died (%w): %s", err, helper.Stderr())
 }
 // resp.Image is a bounds-checked *image.RGBA ready for ntpicture.
 ```
+
+`Do` never times out on its own, so always pass a context with a deadline.
+Requests are served one at a time: a `Do` whose context ends while it is still
+waiting behind another request returns the context error and leaves the worker
+running, while one whose context ends after the request was sent closes the
+connection and kills the worker.
+
+`ServeRender` checks every handler result against the request before sending
+it. An image larger than the request's `Width`, `Height`, or `MaxPixels`, or a
+non-finite or negative intrinsic size, is returned to the host as a
+`*RenderError` describing the problem instead of being sent. A worker written
+in another language must apply the same limits itself: the host treats any
+out-of-bounds reply as a protocol violation and kills the worker.
 
 ---
 
@@ -132,7 +152,7 @@ client, helper, err := ntmediabox.StartMediaHelper(
 		// Compare st.Gen against client.Gen() to ignore stale statuses.
 	},
 	func(fr ntmediabox.Frame) {
-		// fr.RGBA is a bounds-checked *image.RGBA; fr.Gen is the active generation.
+		// fr.Image is a bounds-checked *image.RGBA; fr.Gen is the active generation.
 	},
 )
 if err != nil {
@@ -141,6 +161,8 @@ if err != nil {
 defer helper.Close()
 defer client.Close()
 
+// Handshake must be the first message, and no frames are produced until the
+// first Resize: the worker fits every frame inside the most recent size.
 if err := client.Handshake("video"); err != nil {
 	return err
 }
@@ -214,13 +236,18 @@ Every message starts with a 5-byte frame header:
 | `17..25` | `height` | `f64` (IEEE-754 `u64`) | Intrinsic height |
 | `25..29` | `imgW` | `u32` | Raster width in pixels (`0` if no image) |
 | `29..33` | `imgH` | `u32` | Raster height in pixels (`0` if no image) |
-| `33..35` | `errLen` | `u16` | Byte length of UTF-8 error string (`<= 1024`) |
+| `33..35` | `errLen` | `u16` | Byte length of UTF-8 error string (`<= 1024`); longer or invalid UTF-8 is a protocol violation |
 | `35..39` | `metaLen` | `u32` | Byte length of `Meta` payload (`<= 16 MiB`) |
 | `39..` | `err` | `[errLen]byte` | UTF-8 application error string |
 | `...` | `meta` | `[metaLen]byte` | Optional metadata/text/JSON bytes |
 | `...` | `pix` | `[imgW * imgH * 4]byte` | Tightly packed non-premultiplied/RGBA pixels (`Stride == imgW * 4`) |
 
 *(The fixed response header is `39` bytes.)*
+
+`width` and `height` must be finite and `>= 0`. `imgW`/`imgH` must not exceed
+the request's `width`/`height` (or `8192` when the request passes `0`), and
+`imgW * imgH` must not exceed the request's `maxPixels` (or `33554432` when it
+passes `0`). The host kills a worker that breaks any of these rules.
 
 ---
 
@@ -310,16 +337,22 @@ int main() {
         uint32_t page     = be32(fixed + 0);
         uint32_t width    = be32(fixed + 4);
         uint32_t height   = be32(fixed + 8);
+        uint64_t max_pixels = (uint64_t(be32(fixed + 16)) << 32) | be32(fixed + 20);
         uint32_t meta_len = be32(fixed + 60);
         uint32_t data_len = be32(fixed + 64);
+        if (meta_len > (16u << 20) || data_len > (128u << 20)) return 1;
 
         std::vector<uint8_t> meta(meta_len), data(data_len);
         if (meta_len > 0 && !read_full(kWorkerFD, meta.data(), meta_len)) return 1;
         if (data_len > 0 && !read_full(kWorkerFD, data.data(), data_len)) return 1;
 
         // Example: synthesize a 2x2 RGBA image (replace with MuPDF/Skia/etc.).
-        uint32_t img_w = width > 0 ? width : 2;
-        uint32_t img_h = height > 0 ? height : 2;
+        // The reply must fit the request: the host kills a worker whose image
+        // exceeds width, height, or maxPixels (0 means 8192 / 8192 / 32 Mpx).
+        if (max_pixels == 0 || max_pixels > (32ull << 20)) max_pixels = 32ull << 20;
+        uint32_t img_w = width > 0 && width < 2 ? width : 2;
+        uint32_t img_h = height > 0 && height < 2 ? height : 2;
+        if (uint64_t(img_w) * img_h > max_pixels) img_w = img_h = 1;
         std::vector<uint8_t> rgba(size_t(img_w) * size_t(img_h) * 4, 0xff);
 
         uint8_t resp_hdr[5 + 39]{};
@@ -365,6 +398,9 @@ MSG_RENDER_REQ  = 0x20
 MSG_RENDER_RESP = 0x21
 FIXED_REQ_FMT   = ">IIIIQddddIII"  # 68 bytes
 FIXED_RESP_FMT  = ">BIIddIIHI"      # 39 bytes
+MAX_ERR_BYTES   = 1024
+MAX_SIDE        = 8192
+MAX_PIXELS      = 32 << 20
 
 
 def recv_exact(sock: socket.socket, n: int) -> bytes:
@@ -391,7 +427,8 @@ def send_resp(
     meta: bytes = b"",
     ended: bool = False,
 ) -> None:
-    err_bytes = err.encode("utf-8")[:1024]
+    # Truncate on a character boundary: invalid UTF-8 is a protocol violation.
+    err_bytes = err.encode("utf-8")[:MAX_ERR_BYTES].decode("utf-8", "ignore").encode("utf-8")
     flags = 1 if ended else 0
     hdr = struct.pack(
         FIXED_RESP_FMT,
@@ -433,8 +470,12 @@ def serve() -> None:
             data = recv_exact(sock, data_len) if data_len else b""
 
             # Replace with Pillow / Matplotlib / CairoSVG rendering:
-            w = width or 64
-            h = height or 64
+            # The reply must fit the request (0 means the protocol maximum).
+            w = min(width or MAX_SIDE, 64)
+            h = min(height or MAX_SIDE, 64)
+            if w * h > (max_pixels or MAX_PIXELS):
+                send_resp(sock, err="requested pixel budget is too small")
+                continue
             rgba = b"\x20\x60\xc0\xff" * (w * h)
             send_resp(
                 sock,

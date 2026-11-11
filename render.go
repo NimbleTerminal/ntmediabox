@@ -16,6 +16,9 @@ const (
 	MaxRenderDataBytes = mediabox.MaxRenderDataBytes
 	MaxRenderMetaBytes = mediabox.MaxRenderMetaBytes
 
+	RenderReqFixedBytes   = mediabox.RenderReqFixedBytes
+	RenderRespHeaderBytes = mediabox.RenderRespHeaderBytes
+
 	RenderFlagText    = mediabox.RenderFlagText
 	RenderFlagDark    = mediabox.RenderFlagDark
 	RenderFlagAnimate = mediabox.RenderFlagAnimate
@@ -36,6 +39,10 @@ type RenderFunc = mediabox.RenderFunc
 
 // RenderClient is the host process's end of a request/response render worker connection.
 type RenderClient = mediabox.RenderClient
+
+// RenderError is an error a worker reported for one request, as opposed to a
+// failure of the connection or of the worker process.
+type RenderError = mediabox.RenderError
 
 // ToRGBA converts src into a tightly packed *image.RGBA with origin (0, 0) and
 // Stride == w*4.

@@ -91,6 +91,11 @@ tasks:
       - GOOS=linux GOARCH=amd64 go build ./...
       - GOOS=linux GOARCH=arm64 go build ./...
 
+  security-doc:
+    desc: Rewrite the generated wire-bound tables in SECURITY.md from the code
+    cmds:
+      - go test -run '^TestSecurityDocInSync$' -count=1 . -update-security-doc
+
   notices:
     desc: Regenerate THIRD_PARTY_NOTICES.md from the modules the library links
     cmds:

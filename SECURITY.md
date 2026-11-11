@@ -47,25 +47,36 @@ framing (`length == 1 + len(payload)`).
 
 ### Streaming Media Protocol (`Client` / `Serve`)
 
-| Bound | Constant / Value | Invariant enforced before allocation |
+<!-- BEGIN GENERATED:media-bounds (edit the code, then run `task security-doc`) -->
+| Bound | Constant | Invariant enforced before allocation |
 | --- | --- | --- |
-| Control frame size | `maxControlLen = 32768` (`32 KiB`) | `1 <= n <= maxControlLen` on all control frames (`msgHello`, `msgOpen`, `msgStatus`, etc.) |
-| Video frame dimensions | `MaxFrameSide = 4096` | `1 <= w <= maxW <= MaxFrameSide` and `1 <= h <= maxH <= MaxFrameSide` |
-| Video frame byte length | `frameHeader = 24` | `uint64(n) == 1 + 24 + uint64(w)*uint64(h)*4` checked in `uint64` arithmetic before allocating `image.NewRGBA` |
-| Filename / kind length | `maxNameLen = 255` | Bare filename only (`isBareFilename`): no `/`, `\`, `..`, NUL, or control chars |
-| Subtitle / track caps | `maxCaptions = 16`, `maxTracks = 16`, `maxTrackFieldLen = 255` | Rejects counts `> 16` or trailing unparsed bytes |
-| Caption & error text | `maxCaptionTextLen = 4096`, `maxErrLen = 1024` | Must be valid UTF-8; sanitized via `sanitizeWorkerString` |
+| Control message size | `MaxControlBytes = 32768` | `1 <= n <= MaxControlBytes` on every non-frame message |
+| Video frame dimensions | `MaxFrameSide = 4096` | `1 <= w <= maxW <= MaxFrameSide` and `1 <= h <= maxH <= MaxFrameSide`, where `maxW`/`maxH` are the largest sizes the host has requested |
+| Video frame byte length | `FrameHeaderBytes = 24` | `uint64(n) == 1 + 24 + uint64(w)*uint64(h)*4`, checked before `image.NewRGBA` |
+| Filename / kind length | `MaxNameBytes = 255` | Bare filename only: no `/`, `\`, `:`, `.`, `..`, leading `-`, or control characters |
+| Sidecar captions per open | `MaxCaptions = 16` | Larger counts and trailing unparsed bytes are rejected |
+| Caption tracks per status | `MaxTracks = 32` | Larger counts and trailing unparsed bytes are rejected |
+| Track / caption field length | `MaxTrackFieldBytes = 128` | Longer fields are rejected; worker-supplied fields are sanitized |
+| Caption text | `MaxCaptionTextBytes = 4096` | Must be valid UTF-8; sanitized |
+| Error text | `MaxErrBytes = 1024` | Must be valid UTF-8; sanitized |
+<!-- END GENERATED:media-bounds -->
 
 ### Document, Vector & Still-Image Protocol (`RenderClient` / `ServeRender`)
 
-| Bound | Constant / Value | Invariant enforced before allocation |
+<!-- BEGIN GENERATED:render-bounds (edit the code, then run `task security-doc`) -->
+| Bound | Constant | Invariant enforced before allocation |
 | --- | --- | --- |
 | Raster dimensions | `MaxRenderSide = 8192` | `1 <= imgW <= maxW <= MaxRenderSide` and `1 <= imgH <= maxH <= MaxRenderSide` |
-| Raster pixel budget | `MaxRenderPixels = 32 << 20` (`32 Mpx` / `128 MiB` RGBA) | `uint64(imgW)*uint64(imgH) <= uint64(maxPixels) <= MaxRenderPixels` |
-| Request input bytes | `MaxRenderDataBytes = 128 << 20` (`128 MiB`) | `dataLen <= MaxRenderDataBytes` |
-| Structured metadata bytes | `MaxRenderMetaBytes = 16 << 20` (`16 MiB`) | `metaLen <= MaxRenderMetaBytes` |
-| Exact response frame size | `renderRespHeader = 39` | `uint64(n) == 1 + 39 + uint64(errLen) + uint64(metaLen) + uint64(imgW)*uint64(imgH)*4` verified before allocating `Meta` or `Image` |
-| Intrinsic dimensions | `Width`, `Height` (`float64`) | Must be finite (`!math.IsNaN`, `!math.IsInf`) and `>= 0` |
+| Raster pixel budget | `MaxRenderPixels = 33554432` (128 MiB RGBA) | `uint64(imgW)*uint64(imgH) <= maxPixels <= MaxRenderPixels` |
+| Request input bytes | `MaxRenderDataBytes = 134217728` (128 MiB) | `dataLen <= MaxRenderDataBytes` |
+| Structured metadata bytes | `MaxRenderMetaBytes = 16777216` (16 MiB) | `metaLen <= MaxRenderMetaBytes` |
+| Error text | `MaxErrBytes = 1024` | `errLen <= MaxErrBytes`; must be valid UTF-8; sanitized |
+| Exact response size | `RenderRespHeaderBytes = 39` | `uint64(n) == 1 + 39 + errLen + metaLen + uint64(imgW)*uint64(imgH)*4`, checked before `Meta` or `Image` is allocated |
+| Intrinsic dimensions | `Width`, `Height` (`float64`) | Must be finite and `>= 0` |
+<!-- END GENERATED:render-bounds -->
+
+The tables above are rendered from the exported constants in `pkg/mediabox` by
+`TestSecurityDocInSync`, which fails when they drift.
 
 ---
 
@@ -76,12 +87,17 @@ Trojan-Source bidi overrides into the host terminal:
 
 - **`Status.Err`, `Status.CaptionText`, `Track.{ID,Label,Language,Kind}`, and `RenderResponse.Err`:**
   Validated as UTF-8 (`utf8.ValidString`) and passed through `sanitizeWorkerString`:
-  - Strips ANSI CSI (`ESC [ ... final`) and OSC (`ESC ] ... BEL/ST`) sequences
-    and bare `ESC` (`0x1b`) prefixes.
-  - Strips all C0 controls (`< 0x20`, except `\n` in `CaptionText` and `\t`
-    converted to space), `DEL` (`0x7f`), C1 controls (`U+0080..U+009F`), line/paragraph
-    separators (`U+2028`, `U+2029`), and Unicode bidi override/isolate codepoints
-    (`U+200E`, `U+200F`, `U+061C`, `U+202A..U+202E`, `U+2066..U+2069`).
+  - Removes whole escape sequences: CSI, OSC, DCS, SOS, PM, APC, and nF /
+    two-byte `ESC` sequences, in both 7-bit (`ESC`-prefixed) and 8-bit C1 forms.
+    An unterminated string sequence is dropped only to the end of its line.
+  - Removes all remaining C0 controls (`< 0x20`), `DEL` (`0x7f`), and C1
+    controls (`U+0080..U+009F`). `\n` is kept only in `CaptionText`; `\t` becomes
+    a space.
+  - Removes line/paragraph separators (`U+2028`, `U+2029`) and Unicode bidi
+    marks, embeddings, overrides, and isolates (`U+200E`, `U+200F`, `U+061C`,
+    `U+202A..U+202E`, `U+2066..U+2069`).
+  - An error string that is non-empty on the wire but sanitizes to nothing is
+    replaced with a fixed placeholder, so a failure never reads as success.
 - **`RenderResponse.Meta`:**
   Returned as raw untrusted bytes (`<= MaxRenderMetaBytes`) for structured
   machine parsing (e.g., JSON layout/hit-test metadata). Hosts **must not**
@@ -109,7 +125,9 @@ Trojan-Source bidi overrides into the host terminal:
   If the worker violates the wire protocol (`ErrProtocol`) or if a
   `RenderClient.Do(ctx, req)` call is cancelled by `ctx.Done()`, the client
   closes the connection and `Helper.Close()` sends `SIGKILL` to the worker's
-  process group and reaps the child.
+  process group and reaps the child. A `Do` whose context ends while it is
+  still queued behind another request has sent nothing, so it returns the
+  context error and leaves the worker running.
 
 ---
 
@@ -128,6 +146,11 @@ When modifying `ntmediabox`, verify every item below:
 - [ ] **Hostile helper output:** Never allocate a slice or `image.RGBA` from a
       worker-supplied length or `w, h` pair until all bounds and exact
       `uint64` byte-count equations are verified.
+- [ ] **Worker-side self-checks:** `Serve` and `ServeRender` must keep turning
+      out-of-bounds decoder or handler output into a reported error, so an
+      honest worker bug is never indistinguishable from a hostile peer.
+- [ ] **Documented bounds:** Change a wire bound in `pkg/mediabox`, then run
+      `task security-doc`; never edit the generated tables by hand.
 - [ ] **Fuzz coverage:** Any change to wire encoding or parsing must keep
       `FuzzParseStatusAndOpen`, `FuzzSanitizeAndTruncateUTF8`, `FuzzServeRead`,
       `FuzzRenderClientResp`, and `FuzzClientRead` passing.

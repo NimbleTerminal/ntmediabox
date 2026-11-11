@@ -23,6 +23,18 @@ import (
 // MaxFrameSide bounds a video frame's width and height in pixels.
 const MaxFrameSide = mediabox.MaxFrameSide
 
+// Wire bounds of the streaming media protocol.
+const (
+	MaxControlBytes     = mediabox.MaxControlBytes
+	FrameHeaderBytes    = mediabox.FrameHeaderBytes
+	MaxCaptions         = mediabox.MaxCaptions
+	MaxTracks           = mediabox.MaxTracks
+	MaxErrBytes         = mediabox.MaxErrBytes
+	MaxCaptionTextBytes = mediabox.MaxCaptionTextBytes
+	MaxTrackFieldBytes  = mediabox.MaxTrackFieldBytes
+	MaxNameBytes        = mediabox.MaxNameBytes
+)
+
 // State is what a media decoder is doing.
 type State = mediabox.State
 

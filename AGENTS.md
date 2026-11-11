@@ -26,3 +26,5 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build ./...
 - **Honest reporting:** `Probe()` and `Helper.Support()` must report only what the OS actually enforces (`landlock+seccomp` on Linux, `sandbox-exec` marked `Deprecated: true` on macOS, `none` elsewhere).
 - **Hostile helper output:** `Client` treats the worker as hostile. Check all lengths and frame dimensions (`1 <= w <= maxW <= MaxFrameSide`, `1 <= h <= maxH <= MaxFrameSide`, `uint64(n) == 1 + frameHeader + uint64(w)*uint64(h)*4`) before allocating.
 - **Generated notices:** Run `task notices` (`task notices-check`) whenever dependencies or build targets change.
+- **Documented bounds:** The wire-bound tables in `SECURITY.md` are generated from the exported constants in `pkg/mediabox`. After changing a bound, run `task security-doc`; `TestSecurityDocInSync` and `TestUsageDocStatesEnforcedLimits` fail when the docs drift.
+- **Worker self-checks:** `Serve` and `ServeRender` validate decoder and handler output against the request and report a readable error, so a worker bug is not mistaken for a hostile peer.
